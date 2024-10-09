@@ -1,8 +1,9 @@
 #![no_std]
 #![no_main]
 
-use defmt::unwrap;
+use defmt::{info, unwrap};
 use embassy_executor::Spawner;
+use embassy_futures::select::Either;
 use embassy_rp::{
     adc::{Adc, Channel as AdcChannel, Config, InterruptHandler},
     gpio::Pull,
@@ -10,7 +11,11 @@ use embassy_rp::{
 };
 use embassy_time::Duration;
 
-use core::{fmt::Write, num::Wrapping};
+use core::{
+    fmt::Write,
+    num::Wrapping,
+    sync::atomic::{AtomicU16, Ordering},
+};
 use embassy_rp::{bind_interrupts, peripherals::UART0, uart};
 use embassy_sync::{blocking_mutex::raw::ThreadModeRawMutex, channel::Channel};
 use heapless::String;
@@ -19,6 +24,7 @@ use {defmt_rtt as _, panic_probe as _};
 
 static SIGNAL_CHANNEL: Channel<ThreadModeRawMutex, SignalType, 4> = Channel::new();
 static PUBLISH_CHANNEL: Channel<ThreadModeRawMutex, PublishSignalType, 4> = Channel::new();
+static NOISE_LEVEL: AtomicU16 = AtomicU16::new(20);
 
 bind_interrupts!(pub struct Irqs {
     ADC_IRQ_FIFO => InterruptHandler;
@@ -55,7 +61,7 @@ async fn main(spawner: Spawner) {
     let seed = adc.read(&mut p28).await.unwrap();
     unwrap!(spawner.spawn(square_generator(seed)));
     unwrap!(spawner.spawn(filter_data()));
-    unwrap!(spawner.spawn(send_to_pc(uart)));
+    unwrap!(spawner.spawn(pc_communication(uart)));
 }
 
 #[embassy_executor::task]
@@ -63,7 +69,8 @@ async fn sine_generator(seed: u16) {
     let mut rnd = fastrand::Rng::with_seed(seed.into());
     let mut current = 0.0;
     loop {
-        let noise = (rnd.f32() - 0.5) * 0.2;
+        let normalized_level = NOISE_LEVEL.load(Ordering::Relaxed) as f32 / 100.0;
+        let noise = (rnd.f32() - 0.5) * normalized_level;
         SIGNAL_CHANNEL
             .send(SignalType::Sine(libm::sinf(current) + noise))
             .await;
@@ -77,7 +84,8 @@ async fn square_generator(seed: u16) {
     let mut rnd = fastrand::Rng::with_seed(seed.into());
     let mut current = Wrapping(0);
     loop {
-        let noise = (rnd.f32() - 0.5) * 0.2;
+        let normalized_level = NOISE_LEVEL.load(Ordering::Relaxed) as f32 / 100.0;
+        let noise = (rnd.f32() - 0.5) * normalized_level;
         if (current.0 / 50) % 2 == 0 {
             SIGNAL_CHANNEL.send(SignalType::Square(1.0 + noise)).await;
         } else {
@@ -126,19 +134,44 @@ async fn filter_data() {
 }
 
 #[embassy_executor::task]
-async fn send_to_pc(mut uart: uart::Uart<'static, UART0, uart::Async>) {
+async fn pc_communication(mut uart: uart::Uart<'static, UART0, uart::Async>) {
     loop {
-        let d = PUBLISH_CHANNEL.receive().await;
+        let d = PUBLISH_CHANNEL.receive();
         let mut buf = String::<64>::new();
-        match d {
-            PublishSignalType::Sine(raw, filtered) => {
-                core::write!(&mut buf, "SINE,{},{}\r\n", raw, filtered).unwrap();
-                uart.write(buf.as_bytes()).await.unwrap();
+        let mut uart_buf = [0u8; 1];
+        let res = embassy_futures::select::select(d, uart.read(&mut uart_buf)).await;
+        match res {
+            Either::First(command) => {
+                match command {
+                    PublishSignalType::Sine(raw, filtered) => {
+                        core::write!(&mut buf, "SINE,{},{}\r\n", raw, filtered).unwrap();
+                        uart.write(buf.as_bytes()).await.unwrap();
+                    }
+                    PublishSignalType::Square(raw, filtered) => {
+                        core::write!(&mut buf, "SQUARE,{},{}\r\n", raw, filtered).unwrap();
+                        uart.write(buf.as_bytes()).await.unwrap();
+                    }
+                };
             }
-            PublishSignalType::Square(raw, filtered) => {
-                core::write!(&mut buf, "SQUARE,{},{}\r\n", raw, filtered).unwrap();
-                uart.write(buf.as_bytes()).await.unwrap();
-            }
-        };
+            Either::Second(_) => match uart_buf[0] {
+                b'p' => {
+                    let mut l = NOISE_LEVEL.load(Ordering::Relaxed);
+                    l += 1;
+                    let l = if l > 100 { 100 } else { l };
+                    NOISE_LEVEL.store(l, Ordering::Relaxed);
+                    info!("Increased noise level to {}", l);
+                }
+                b'l' => {
+                    let mut l = NOISE_LEVEL.load(Ordering::Relaxed);
+                    l -= 1;
+                    let l = if l == 0 { 1 } else { l };
+                    NOISE_LEVEL.store(l, Ordering::Relaxed);
+                    info!("Decreased noise level to {}", l);
+                }
+                _ => {
+                    info!("{:?}", uart_buf)
+                }
+            },
+        }
     }
 }

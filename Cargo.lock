@@ -899,6 +899,7 @@ dependencies = [
  "defmt-rtt",
  "embassy-embedded-hal",
  "embassy-executor",
+ "embassy-futures",
  "embassy-rp",
  "embassy-sync 0.5.0",
  "embassy-time",
